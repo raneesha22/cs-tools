@@ -30,6 +30,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/config"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/eventbus"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/filestore"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/github"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/handler"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
@@ -629,6 +630,32 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		onboardingStepHandler = handler.NewOnboardingStepHandler(service.NewOnboardingStepService(repository.NewOnboardingStepRepository(db), accessSvc))
 	}
 
+	// Links to the attachment files held in SFTPGo (work item, comment-image and
+	// deployment attachments). Needs a pool, because the metadata and the access
+	// rules (row-level security) live in Postgres, and the SFTPGo settings: with
+	// either missing the routes are not registered and 404, so nothing here can
+	// reach SFTPGo half configured.
+	var storedAttachmentHandler *handler.StoredAttachmentHandler
+	var inlineImageLinker service.InlineImageLinker
+	if db != nil && cfg.HasSFTPGo() {
+		sftpgoClient := filestore.NewClient(cfg.SFTPGoURL, cfg.SFTPGoPublicURL, cfg.SFTPGoUser, cfg.SFTPGoPassword)
+		storedAttachmentRepo := repository.NewStoredAttachmentRepository(repository.NewScoped(db))
+		storedAttachmentSvc := service.NewStoredAttachmentService(
+			storedAttachmentRepo,
+			sftpgoClient,
+			service.StoredAttachmentLimits{
+				MaxBytes:       cfg.AttachmentMaxBytes,
+				InlineMaxBytes: cfg.InlineImageMaxBytes,
+				ReadLinkTTL:    cfg.AttachmentReadLinkTTL,
+				UploadLinkTTL:  cfg.AttachmentUploadLinkTTL,
+			},
+		)
+		// Comments created or edited from here on attach the images they show.
+		inlineImageLinker, _ = storedAttachmentSvc.(service.InlineImageLinker)
+		storedAttachmentHandler = handler.NewStoredAttachmentHandler(storedAttachmentSvc).WithShareCleanup(service.NewAttachmentShareCleanupService(sftpgoClient, accessSvc)).
+			WithUploadCleanup(service.NewAttachmentUploadCleanupService(storedAttachmentRepo, sftpgoClient, accessSvc))
+	}
+
 	// The portal-driven membership writes. Gated on a pool AND
 	// cfg.HasPortalMembershipWrites() -- the flag, a Postgres-authoritative data source
 	// and a complete sales-entity-service connection -- because every one of
@@ -975,6 +1002,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
 		pgCaseFallbackSvc := service.NewCaseService(caseRepo, userRepo, eventPublisher, accessSvc, projectContactRepo)
+		pgCaseFallbackSvc = service.WithInlineImageLinker(pgCaseFallbackSvc, inlineImageLinker)
 		activeCaseSvc = service.NewServiceNowCaseService(serviceNowIntegrationServiceClient, pgCaseFallbackSvc, eventPublisher, snUserService, cfg.CustomerRoles, cfg.CSEngineerRole, slaEngineSvc)
 	case config.DataSourcePostgresServiceNowDualWrite:
 		// Pilot: case CREATE, and UPDATE's WorkState field only.
@@ -1036,6 +1064,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		// registration with a foreign-key violation).
 		snCaseMirrorSvc := service.NewServiceNowCaseService(serviceNowIntegrationServiceClient, nil, nil, snUserService, cfg.CustomerRoles, cfg.CSEngineerRole, nil)
 		activeCaseSvc = service.NewCaseServiceWithSNWriteback(caseRepo, userRepo, eventPublisher, accessSvc, projectContactRepo, snWritebackDispatcher, snCaseMirrorSvc, slaEngineSvc, cfg.CSEngineerRole)
+		activeCaseSvc = service.WithInlineImageLinker(activeCaseSvc, inlineImageLinker)
 		// CreateCase rejects a case/SR whose deployed product's category
 		// doesn't satisfy its project type's own Default Case/SR Creation
 		// Product Category allow-list — see
@@ -1087,6 +1116,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		caseAttachmentOverrideSvc = service.NewCaseAttachmentDualWriteService(activeCaseSvc, snCaseMirrorSvc, snWritebackDispatcher)
 	default:
 		activeCaseSvc = service.NewCaseService(caseRepo, userRepo, eventPublisher, accessSvc, projectContactRepo)
+		activeCaseSvc = service.WithInlineImageLinker(activeCaseSvc, inlineImageLinker)
 		// See the matching comment in the DataSourcePostgresServiceNowDualWrite
 		// case above.
 		activeCaseSvc = service.WithProductCategoryEnforcement(activeCaseSvc, referenceDataRepo, deployedProductRepo)
@@ -1827,6 +1857,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	default:
 		activeCommentSvc = service.NewCommentService(commentRepo, userRepo)
 	}
+	activeCommentSvc = service.WithCommentInlineImageLinker(activeCommentSvc, inlineImageLinker)
 	commentHandler := handler.NewCommentHandler(activeCommentSvc)
 
 	taskSlaRepo := repository.NewTaskSlaRepository(repository.NewScoped(db))
@@ -1877,6 +1908,15 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		mux.HandleFunc("PUT /onboarding-steps/{membershipSfId}/{step}", onboardingStepHandler.UpsertOnboardingStep)
 		mux.HandleFunc("GET /onboarding-steps/{membershipSfId}", onboardingStepHandler.GetOnboardingSteps)
 		mux.HandleFunc("POST /onboarding-steps/search", onboardingStepHandler.SearchOnboardingSteps)
+	}
+	if storedAttachmentHandler != nil {
+		mux.HandleFunc("POST /attachments/download", storedAttachmentHandler.ResolveLinks)
+		mux.HandleFunc("POST /attachments/upload", storedAttachmentHandler.InitiateUpload)
+		mux.HandleFunc("POST /attachments/upload/{id}/confirm", storedAttachmentHandler.ConfirmUpload)
+		mux.HandleFunc("POST /attachments/delete", storedAttachmentHandler.DeleteAttachment)
+		mux.HandleFunc("GET /attachments/inline/{id}/content", storedAttachmentHandler.InlineImageContent)
+		mux.HandleFunc("POST /attachments/shares/cleanup", storedAttachmentHandler.CleanupShares)
+		mux.HandleFunc("POST /attachments/uploads/cleanup", storedAttachmentHandler.CleanupUploads)
 	}
 
 	// event_publish_failures, sla_clocks, scheduled_task_run and

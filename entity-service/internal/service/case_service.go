@@ -125,6 +125,9 @@ type caseService struct {
 	// nil before use anyway, same posture as every other optional
 	// dependency on this struct.
 	volumeTrendCache CaseVolumeTrendCache
+
+	// imageLinker attaches the comment images a new comment shows (nil: none).
+	imageLinker InlineImageLinker
 }
 
 // srNotifier is what caseService needs from SRNoticeService; an interface so
@@ -190,6 +193,16 @@ func WithProductCategoryEnforcement(svc CaseService, referenceDataRepo repositor
 func WithCSEngineerRole(svc CaseService, csEngineerRole string) CaseService {
 	if cs, ok := svc.(*caseService); ok {
 		cs.csEngineerRole = csEngineerRole
+	}
+	return svc
+}
+
+// WithInlineImageLinker attaches the linker that, when a comment is saved,
+// attaches the comment images it shows to it. Same post-construction wiring shape
+// as WithCSEngineerRole; a no-op if svc is not a *caseService or l is nil.
+func WithInlineImageLinker(svc CaseService, l InlineImageLinker) CaseService {
+	if cs, ok := svc.(*caseService); ok && l != nil {
+		cs.imageLinker = l
 	}
 	return svc
 }
@@ -1390,6 +1403,10 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 	}
 
 	s.subscribeCommenterToWatchList(ctx, req.CaseID, actorEmail)
+
+	if s.imageLinker != nil {
+		s.imageLinker.LinkFromContent(ctx, c.ID, req.CaseID, actorEmail, req.Content)
+	}
 
 	// Computed once, used by both the SLA-engine hook and the published
 	// event's own IsSupportEngineerResponse flag below -- see

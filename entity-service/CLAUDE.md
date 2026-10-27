@@ -65,6 +65,12 @@ The server loads `.env` automatically on startup (silently ignored if absent). P
 | `SALES_ENTITY_CLIENT_ID` | no* | — | Choreo connection client id |
 | `SALES_ENTITY_CLIENT_SECRET` | no* | — | Choreo connection client secret |
 | `SALES_ENTITY_SCOPES` | no | — | Optional space-separated OAuth2 scopes for REST `sales/sales-entity-service` |
+| `SFTPGO_URL` | no* | — | SFTPGo base URL this service reaches it at (see "Attachment files in SFTPGo"). *All three of `SFTPGO_URL`/`SFTPGO_USER`/`SFTPGO_PASSWORD` or none: `Validate` rejects a partial set, and with none the attachment routes are not registered |
+| `SFTPGO_USER` / `SFTPGO_PASSWORD` | no* | — | The SFTPGo service user. Held only here; never sent to a browser, never echoed in an error |
+| `SFTPGO_PUBLIC_URL` | no | `SFTPGO_URL` | Address a **browser** reaches SFTPGo at, used in the links returned to it. Differs from `SFTPGO_URL` once SFTPGo is behind a public proxy |
+| `SFTPGO_ALLOW_INSECURE_HTTP` | no | `false` | `Validate` requires `SFTPGO_URL` and `SFTPGO_PUBLIC_URL` to be https (the service password and every share id would otherwise cross the wire in clear text, and an http public URL is blocked as mixed content on an https portal). `true` allows http, for local development only |
+| `ATTACHMENT_MAX_BYTES` / `INLINE_IMAGE_MAX_BYTES` | no | 100 MiB / 10 MiB | Largest uploaded file / comment image. Provisional. An unparseable or non-positive value falls back to the default |
+| `ATTACHMENT_READ_LINK_TTL` / `ATTACHMENT_UPLOAD_LINK_TTL` | no | `1m` / `15m` | How long a download / upload link stays valid |
 | `CSM_MIGRATION_MEMBERSHIP_REGISTRATION_ENABLED` | no | `false` | Must be `"true"` for `POST /users/me/memberships/register` to be registered at all (see "Membership registration" below). Off = the route 404s and nothing on that path can write to Salesforce |
 | `CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED` | no | `false` | Must be `"true"` for `POST /salesforce/events` to act on `Project_Contact__c`/`Contact` envelopes, the Contact writer included (see "Salesforce membership ingest" and "The Contact writer" below). The Account branch is unaffected |
 | `CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED` | no | `false` | Must be `"true"` for `POST /salesforce/events` to act on `Account` envelopes; off, they are acknowledged and ignored. Keep it off while the ServiceNow sync still writes `account`. The upsert resolves the row by `sf_id` (not unique since migration 0095), then links a same-`number` row with no `sf_id`, then inserts; the SE-1 columns are kept when Salesforce sends none; see "Salesforce Account ingest" for the full column set |
@@ -1681,6 +1687,124 @@ response: the case/comment/incident already exists in ServiceNow by that
 point, so a notification-side hiccup must not be reported to the caller as a
 failed
 create.
+
+## Attachment files in SFTPGo
+
+Work item, comment-image and deployment attachment files live in SFTPGo
+(`work_item_attachment`, `comment_attachment`, `deployment_attachment`; `case_attachment` is
+the older flow and is not touched). Seven routes, registered only when `db != nil` and
+`Config.HasSFTPGo()` (otherwise 404): `POST /attachments/download`, `POST /attachments/upload`,
+`POST /attachments/upload/{id}/confirm`, `POST /attachments/delete`, `GET /attachments/inline/{id}/content`, `POST /attachments/shares/cleanup`, `POST /attachments/uploads/cleanup`. Code: `internal/filestore` (SFTPGo client and the path
+layout), `service.StoredAttachmentService`, `repository.StoredAttachmentRepository`,
+`handler.StoredAttachmentHandler`.
+
+**A browser never gets an SFTPGo token.** The service user's token can read and write everything
+under `csm/`, so what a browser receives is an SFTPGo *share*: a **download** link is a read share
+on exactly one file (`GET /api/v2/shares/{id}?compress=false`; without `compress=false` SFTPGo
+sends a ZIP), a read link is nearly single-use, so a copied or logged URL is dead once the real browser has opened
+it: a `download` link serves 1 request, a `preview` link (inline image, `purpose` on the request) 2, and
+either expires in `ATTACHMENT_READ_LINK_TTL` (default 1m). The webapp asks again when a link has gone; an **upload** link is a write share on a folder created for
+that one upload (`csm/staging/<attachment id>/`) with `max_tokens` 1, so it accepts exactly one
+request. SFTPGo stores the multipart file under its base name, so a client cannot escape the
+folder, and it overwrites a file of the same name, which is why the folder is per upload.
+Responses carry `Cache-Control: no-store`.
+
+**Comment images are streamed, not linked.** `GET /attachments/inline/{id}/content` reads the image from
+SFTPGo (`filestore.Open`) and streams it to the caller, so a browser showing a comment never talks to SFTPGo
+and no URL exists that could be forwarded to someone without access; the caller's own row-level security
+decides on every request, and an image they cannot see, that is not stored or was deleted is 404. The
+response type is the stored image type (anything else is sent as `application/octet-stream`), with
+`nosniff`, a sandboxing `Content-Security-Policy` and `Cache-Control: private, max-age=300`. Each request
+writes an `attachment content served` audit line (callerId, correlationId, attachmentId, path). The portal
+backends pass it through (browser -> backend -> entity-service); only upload and download use share links.
+
+**Share cleanup.** Each link is a stored record in SFTPGo, and one that expired or was used up is not
+necessarily removed by SFTPGo itself (not confirmed either way). `POST /attachments/shares/cleanup`
+(internal callers only, meant for a scheduled trigger such as a Choreo cron) lists the service user's
+shares and deletes the ones entity-service made (named `dl` and `up`) that expired more than 5 minutes ago
+or whose `used_tokens` reached `max_tokens`, at most 500 per run, and answers `{scanned, deleted, failed}`.
+A share that cannot be deleted is counted as failed and tried again on the next run. The list and delete
+calls (`GET /api/v2/user/shares`, `DELETE /api/v2/user/shares/{id}`) have not been run against a live SFTPGo.
+
+**Abandoned uploads.** An upload that is started and never confirmed leaves a `PENDING` row and a folder under
+`csm/staging/<attachment id>`. `POST /attachments/uploads/cleanup` (internal callers only, for a scheduled trigger)
+finds the rows still `PENDING` after 24 hours (a confirm that failed on a storage error leaves its file staged on
+purpose, so this is long next to the 15 minute link), removes each staging folder and marks the row `FAILED`, at
+most 200 per run, and answers `{found, cleaned, failed}`. A folder that cannot be removed leaves the row `PENDING`
+for the next run. Run it together with `/attachments/shares/cleanup`.
+
+**Saved file names are the webapp's job.** SFTPGo names a download after the stored file, which carries the
+attachment number (`wia0000042_report.pdf`), and a share link has no option to change that. So the webapp
+does not navigate to a download link: it `fetch`es the link and saves the bytes under the attachment's own
+`name` from the response (an `<a download>` is ignored on another origin). That needs CORS on SFTPGo's public
+`GET /api/v2/shares/*` (the upload route needs it already) and holds the whole file in the browser, which is
+fine at `ATTACHMENT_MAX_BYTES` (100 MiB). Entity-service keeps the migrator's key layout unchanged.
+
+**Who made each link is logged here, not in SFTPGo.** SFTPGo sees only the one service user for
+every browser transfer, so each share created writes an `attachment link created` line
+(`audit=true`, `action` download|upload, `callerId`, `correlationId`, `kind`, `attachmentId`,
+`path`, `shareRef`, `expiresAt`) through `auditLink`. `callerId` is what the access log shows for the
+same request (the user's UUID, else a machine caller's client id, else `-`) and `correlationId` finds
+that request's other lines; **the email is not logged** (personal data). SFTPGo's transfer log carries the same file
+path (for an upload, the staging folder named after the attachment id), so a transfer is matched
+to a person on path and time. **The share id is never logged in full**: it is the link's secret
+(`.../api/v2/shares/<id>`), so anyone reading it from a log could use the link until it expires;
+`shareRef` is a short prefix, for recognising a link in a proxy log only. Nothing is logged for a
+link that was not created. It is a log line, not a table: add an audit table if retention beyond the
+log platform's is needed. The proxy's access log holds full share ids in its URLs, so access to it
+should be as restricted as the logs of any system holding live links.
+
+**Upload flow.** `POST /attachments/upload` checks the parent as the caller (a hidden parent is
+404), refuses a **closed work item for every caller, internal ones included** (409), checks size
+and type, inserts a `PENDING` row (`created_by` = the caller's email), creates the staging folder
+and the one-use share. The browser POSTs the file to `uploadUrl`. `.../confirm` (only the
+uploader) lists the staging folder (exactly one file), checks its size against what was declared
+and the limit, re-checks the work item is still open, and for a comment image reads the leading
+bytes and requires a real PNG/JPEG/GIF/WebP (SVG is refused: it can carry script). It then creates
+the final folder, renames the file to `filestore.Key` (the migrator's layout, so new files sit
+beside migrated ones), and marks the row `COMPLETE` as the system. A rejected upload is deleted and
+the row `FAILED`; a storage error leaves the row `PENDING` and the file staged so confirm can be
+retried.
+
+**Delete (`POST /attachments/delete`, body `{kind, id}` -> 204).** A soft delete: the file is
+removed from SFTPGo first (`DELETE /api/v2/user/files`, a file already gone is fine), then the row
+is marked `DELETED` with `deleted_on`/`deleted_by` (migration 0249; the file-first order means a
+failure in between leaves a `COMPLETE` row whose file is gone, and repeating the call finishes it).
+For now **only the person who uploaded it may delete** (`created_by` = the caller's email, case
+ignored; anyone else who can see it gets 403; the "internal admin" rule is still to be decided), and
+**never once the work item is closed** (409). The decision is made in the service, not by RLS:
+UPDATE on these tables is internal-only, so the mark runs under `WithSystemIdentity` like confirm.
+An image embedded in a comment is not deleted on its own (400). A repeated delete answers 204. A
+`DELETED` attachment has no download link (reason `DELETED`), and the case attachment lists and
+the activity feed skip it (`listedStoredAttachmentSQL`, which also hides `FAILED` rows and uploads
+still in flight). Each delete writes an `attachment deleted` audit line like the link lines.
+
+**Limits on links.** One download call takes at most 20 ids, and one caller (`callerId`) may have 60 shares created per minute across download and upload links (`shareLimiter`, in memory and per pod); beyond that the call is a 429 and nothing is created. Every share is a stored record in SFTPGo, so a client should ask for a link only when a user opens, downloads or sees one attachment, never for a whole list.
+
+**Access is the caller's own.** The repository holds a `*Scoped`, so reads and the INSERT run
+under the attachment tables' RLS (migration 100026): an external caller needs to be a
+`REGISTERED` member of the parent's project, a parent with no project is internal-only, and an
+attachment of a `WORK_NOTE` comment stays internal because `comment_attachment`'s policy goes
+through `comment`'s. An external INSERT must be `PENDING` with no `storage_key`. UPDATE and DELETE
+are internal-only, which is why `ConfirmUpload` runs `MarkComplete`/`MarkFailed` under
+`repository.WithSystemIdentity` after its own checks. There is deliberately no `AccessService`
+in this service. The three tables have no row-level id default except `work_item_attachment`
+(migration 0179), so `InsertPending` generates the id.
+
+**Inline comment images** are uploaded against the work item before the comment exists, so a new image is a
+`comment_attachment` row with `comment_id` NULL and `work_item_id` set (migration 0150), visible only to its
+uploader. The comment's HTML refers to it by `<img src=".../attachments/inline/<attachment id>/content">`; the
+client sends no list. When a comment is created or edited (`caseService.createCaseCommentAs`,
+`commentService.CreateComment`/`UpdateComment`, through `InlineImageLinker.LinkFromContent`) entity-service reads
+those ids out of the content and links each image (`comment_id` set), but only if the comment's author
+uploaded it, it is stored, and it belongs to the comment's own work item. That is best effort: a failure is
+logged and the comment is saved anyway. An image still unlinked after 24 hours is removed (file deleted, row
+`DELETED`) by `POST /attachments/uploads/cleanup`. Preview is `GET /attachments/inline/{id}/content`.
+
+Verification: unit tests use a fake SFTPGo (`httptest`) and in-memory fakes; the repository
+integration test needs `STORED_ATTACHMENT_TEST_DSN` (a role that does not bypass RLS, all
+migrations applied). Two SFTPGo calls were not confirmed against a live server: the folder listing
+JSON shape and the ranged read (`ListDir`, `ReadHead`).
 
 ## Portal-driven membership writes
 

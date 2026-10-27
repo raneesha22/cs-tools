@@ -1407,3 +1407,113 @@ func TestConfig_IncidentExtraAssignmentGroupIDs(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_Validate_SFTPGoAllOrNothing(t *testing.T) {
+	tests := []struct {
+		name              string
+		url, user, passwd string
+		wantErr           bool
+	}{
+		{name: "none set"},
+		{name: "all three set", url: "https://sftpgo.internal:8080", user: "svc", passwd: "p"},
+		{name: "only url", url: "https://sftpgo.internal:8080", wantErr: true},
+		{name: "only user", user: "svc", wantErr: true},
+		{name: "only password", passwd: "p", wantErr: true},
+		{name: "missing password", url: "https://sftpgo.internal:8080", user: "svc", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseValidConfig()
+			c.SFTPGoURL, c.SFTPGoPublicURL = tt.url, tt.url
+			c.SFTPGoUser, c.SFTPGoPassword = tt.user, tt.passwd
+			err := c.Validate()
+			if tt.wantErr && err == nil {
+				t.Error("Validate() = nil, want an error for a partial SFTPGo configuration")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestConfig_Validate_SFTPGoRequiresHTTPSUnlessOptedOut(t *testing.T) {
+	c := baseValidConfig()
+	c.SFTPGoURL, c.SFTPGoPublicURL, c.SFTPGoUser, c.SFTPGoPassword = "http://localhost:8080", "http://localhost:8080", "svc", "p"
+	if err := c.Validate(); err == nil {
+		t.Error("an http SFTPGO_URL was accepted without SFTPGO_ALLOW_INSECURE_HTTP")
+	}
+	c.SFTPGoURL = "https://sftpgo.internal"
+	if err := c.Validate(); err == nil {
+		t.Error("an http SFTPGO_PUBLIC_URL was accepted without SFTPGO_ALLOW_INSECURE_HTTP")
+	}
+	c.SFTPGoURL, c.SFTPGoAllowInsecureHTTP = "http://localhost:8080", true
+	if err := c.Validate(); err != nil {
+		t.Errorf("http with the local-development opt-out: %v", err)
+	}
+}
+
+func TestConfig_Validate_SFTPGoURLsMustBeHTTP(t *testing.T) {
+	for _, bad := range []string{"sftpgo.internal:8080", "ftp://sftpgo", "https://", "not a url"} {
+		c := baseValidConfig()
+		c.SFTPGoURL, c.SFTPGoPublicURL, c.SFTPGoUser, c.SFTPGoPassword = bad, bad, "svc", "s3cret"
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("SFTPGO_URL %q accepted, want an error", bad)
+			continue
+		}
+		if strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("error for %q leaks the password: %v", bad, err)
+		}
+	}
+	// A bad public address alone is also refused.
+	c := baseValidConfig()
+	c.SFTPGoURL, c.SFTPGoPublicURL, c.SFTPGoUser, c.SFTPGoPassword = "https://sftpgo.internal", "files.example.com", "svc", "p"
+	if err := c.Validate(); err == nil {
+		t.Error("a SFTPGO_PUBLIC_URL without a scheme was accepted")
+	}
+}
+
+func TestLoad_SFTPGoDefaultsAndPublicURLFallback(t *testing.T) {
+	for _, k := range []string{"SFTPGO_URL", "SFTPGO_PUBLIC_URL", "SFTPGO_USER", "SFTPGO_PASSWORD",
+		"ATTACHMENT_MAX_BYTES", "INLINE_IMAGE_MAX_BYTES", "ATTACHMENT_READ_LINK_TTL", "ATTACHMENT_UPLOAD_LINK_TTL"} {
+		t.Setenv(k, "")
+	}
+	c := Load()
+	if c.HasSFTPGo() {
+		t.Error("HasSFTPGo() = true with nothing configured")
+	}
+	if c.AttachmentMaxBytes != 100<<20 || c.InlineImageMaxBytes != 10<<20 {
+		t.Errorf("size limits = %d / %d, want 100 MiB / 10 MiB", c.AttachmentMaxBytes, c.InlineImageMaxBytes)
+	}
+	if c.AttachmentReadLinkTTL != time.Minute || c.AttachmentUploadLinkTTL != 15*time.Minute {
+		t.Errorf("link TTLs = %s / %s, want 1m / 15m", c.AttachmentReadLinkTTL, c.AttachmentUploadLinkTTL)
+	}
+
+	t.Setenv("SFTPGO_URL", " https://sftpgo.internal:8080/ ")
+	t.Setenv("SFTPGO_USER", "svc")
+	t.Setenv("SFTPGO_PASSWORD", "p")
+	c = Load()
+	if !c.HasSFTPGo() || c.SFTPGoURL != "https://sftpgo.internal:8080" {
+		t.Errorf("SFTPGoURL = %q, HasSFTPGo = %v", c.SFTPGoURL, c.HasSFTPGo())
+	}
+	if c.SFTPGoPublicURL != c.SFTPGoURL {
+		t.Errorf("public URL = %q, want it to fall back to %q", c.SFTPGoPublicURL, c.SFTPGoURL)
+	}
+
+	t.Setenv("SFTPGO_PUBLIC_URL", "https://files.example.com/")
+	t.Setenv("ATTACHMENT_MAX_BYTES", "52428800")
+	t.Setenv("ATTACHMENT_READ_LINK_TTL", "2m")
+	c = Load()
+	if c.SFTPGoPublicURL != "https://files.example.com" || c.AttachmentMaxBytes != 52428800 || c.AttachmentReadLinkTTL != 2*time.Minute {
+		t.Errorf("overrides not read: public=%q max=%d ttl=%s", c.SFTPGoPublicURL, c.AttachmentMaxBytes, c.AttachmentReadLinkTTL)
+	}
+
+	// A typo costs the override, not the service.
+	t.Setenv("ATTACHMENT_MAX_BYTES", "lots")
+	t.Setenv("ATTACHMENT_READ_LINK_TTL", "-5m")
+	c = Load()
+	if c.AttachmentMaxBytes != 100<<20 || c.AttachmentReadLinkTTL != time.Minute {
+		t.Errorf("bad values did not fall back to the defaults: %d / %s", c.AttachmentMaxBytes, c.AttachmentReadLinkTTL)
+	}
+}
