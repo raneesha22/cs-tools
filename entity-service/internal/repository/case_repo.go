@@ -18,6 +18,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -896,10 +897,14 @@ func createCaseTx(ctx context.Context, tx pgx.Tx, req domain.CreateCaseRequest) 
 			req.ConversationID,
 		)
 	case "service_request":
+		catalogJSON, jsonErr := serviceRequestCatalogJSON(req)
+		if jsonErr != nil {
+			return domain.Case{}, fmt.Errorf("create service request: encode catalog answers: %w", jsonErr)
+		}
 		row = tx.QueryRow(ctx, createServiceRequestPortalQuery,
 			req.CreatedBy, req.ProjectID, req.DeploymentID, req.DeployedProductID,
 			req.Subject, req.Description,
-			req.ConversationID,
+			req.ConversationID, catalogJSON,
 		)
 	case "engagement":
 		row = tx.QueryRow(ctx, createEngagementPortalQuery,
@@ -1101,8 +1106,8 @@ const createServiceRequestPortalQuery = `
 		          subject, description, created_on, updated_on
 	),
 	inserted_service_request AS (
-		INSERT INTO service_request (id, state)
-		SELECT id, 'OPEN'::service_request_state_enum
+		INSERT INTO service_request (id, state, json_data)
+		SELECT id, 'OPEN'::service_request_state_enum, $8::jsonb
 		FROM inserted_work_item
 		RETURNING id, state, closed_on
 	)
@@ -1113,6 +1118,25 @@ const createServiceRequestPortalQuery = `
 	       iwi.created_on, iwi.updated_on, isr.closed_on
 	FROM inserted_work_item iwi
 	JOIN inserted_service_request isr ON isr.id = iwi.id`
+
+// serviceRequestCatalogJSON is what a catalog-form service request stores in
+// service_request.json_data: the catalog item and its answers with their
+// question text, under keys that do not collide with the u_* keys a
+// GitHub-raised service request keeps there. Nil (NULL) when the request
+// names no catalog item.
+func serviceRequestCatalogJSON(req domain.CreateCaseRequest) ([]byte, error) {
+	if req.CatalogItemID == "" {
+		return nil, nil
+	}
+	answers := req.ServiceRequestAnswers
+	if answers == nil {
+		answers = []domain.ServiceRequestAnswer{}
+	}
+	return json.Marshal(struct {
+		CatalogItemID string                        `json:"catalogItemId"`
+		Variables     []domain.ServiceRequestAnswer `json:"variables"`
+	}{req.CatalogItemID, answers})
+}
 
 // createEngagementPortalQuery is createCasePortalQuery's counterpart for
 // req.Type == "engagement" -- same relationship createEngagementFromServiceNowQuery
