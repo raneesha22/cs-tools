@@ -18,11 +18,13 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
 
 // ServiceRequest is what the sr.* events need to know about one service
@@ -42,6 +44,11 @@ type ServiceRequest struct {
 	CreatedBy           string
 	CreatedOn           time.Time
 	Tags                []string
+	// CatalogItemID and Answers are a catalog-form service request's item
+	// and answers (service_request.json_data, see serviceRequestCatalogJSON);
+	// empty for any other service request.
+	CatalogItemID string
+	Answers       []domain.ServiceRequestAnswer
 }
 
 // SRNoticeRepository backs the service-request automation ported from
@@ -78,7 +85,9 @@ const getServiceRequestQuery = `
 	       COALESCE(wi.description, ''), COALESCE(sr.state::text, ''),
 	       COALESCE(wi.project_id::text, ''), COALESCE(p.name, ''),
 	       COALESCE(a.sre_team_id::text, ''), COALESCE(st.name, ''),
-	       COALESCE(ag.name, ''), wi.created_by, wi.created_on
+	       COALESCE(ag.name, ''), wi.created_by, wi.created_on,
+	       COALESCE(sr.json_data ->> 'catalogItemId', ''),
+	       COALESCE(sr.json_data -> 'variables', '[]'::jsonb)::text
 	FROM work_item wi
 	JOIN service_request sr ON sr.id = wi.id
 	LEFT JOIN project p ON p.id = wi.project_id
@@ -90,18 +99,25 @@ const getServiceRequestQuery = `
 // GetServiceRequest implements SRNoticeRepository.
 func (r *srNoticeRepo) GetServiceRequest(ctx context.Context, caseID string) (ServiceRequest, bool, error) {
 	var sr ServiceRequest
+	var answersJSON string
 	err := r.db.QueryRow(ctx, getServiceRequestQuery, caseID).Scan(
 		&sr.ID, &sr.Number, &sr.WSO2CaseID, &sr.Subject,
 		&sr.Description, &sr.State,
 		&sr.ProjectID, &sr.ProjectName,
 		&sr.SRETeamID, &sr.SRETeamName,
 		&sr.AssignmentGroupName, &sr.CreatedBy, &sr.CreatedOn,
+		&sr.CatalogItemID, &answersJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ServiceRequest{}, false, nil
 	}
 	if err != nil {
 		return ServiceRequest{}, false, fmt.Errorf("get service request: %w", err)
+	}
+	// A json_data written by something else (a GitHub-raised SR's u_* keys)
+	// has no variables array; a malformed one is ignored, not fatal.
+	if err := json.Unmarshal([]byte(answersJSON), &sr.Answers); err != nil {
+		sr.Answers = nil
 	}
 
 	rows, err := r.db.Query(ctx, `
