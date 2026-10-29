@@ -117,14 +117,20 @@ func (s *SRNoticeService) onCreated(ctx context.Context, caseID string, mirror s
 		}
 	}
 
+	var variables []events.SRVariable
+	for _, a := range sr.Answers {
+		variables = append(variables, events.SRVariable{Question: a.Question, Value: a.Value})
+	}
 	s.publish(ctx, events.TypeSRCreated, caseID, events.SRCreatedPayload{
-		SRRef:       srRef(sr),
-		Description: sr.Description,
-		State:       srStateLabel(sr.State),
-		ProjectID:   sr.ProjectID,
-		ProjectName: sr.ProjectName,
-		CreatedBy:   sr.CreatedBy,
-		CreatedOn:   sr.CreatedOn.UTC().Format(time.RFC3339),
+		SRRef:         srRef(sr),
+		Description:   sr.Description,
+		State:         srStateLabel(sr.State),
+		ProjectID:     sr.ProjectID,
+		ProjectName:   sr.ProjectName,
+		CreatedBy:     sr.CreatedBy,
+		CreatedOn:     sr.CreatedOn.UTC().Format(time.RFC3339),
+		CatalogItemID: sr.CatalogItemID,
+		Variables:     variables,
 	})
 
 	if !automated {
