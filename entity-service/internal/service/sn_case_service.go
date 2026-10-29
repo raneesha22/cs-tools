@@ -1835,6 +1835,44 @@ var caseStateDisplayLabel = map[domain.CaseState]string{
 // silently stop notifications from firing. newStatus is a display label —
 // ServiceNow's own raw state label for snCaseService's callers (e.g. "Work
 // In Progress"), or caseStateDisplayLabel's lookup for caseService's own
+// publishSRStatusChangedEvent publishes sr.status_changed for a service
+// request's state change. Unlike publishStatusChangedEvent it does not
+// depend on watchers (nobody is emailed from it) and carries no
+// recipients, so a consumer such as the log-request automation hears about
+// every close. A case with no project is still published: projectId is
+// left empty, since this event has no email to address. Best effort, like
+// the other publishers here.
+func publishSRStatusChangedEvent(ctx context.Context, publisher EventPublisherService, caseID, newStatus string, before domain.CaseView) {
+	if publisher == nil || newStatus == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, publishStatusChangedTimeout)
+	defer cancel()
+
+	projectID := ""
+	if before.ProjectDetails != nil {
+		projectID = before.ProjectDetails.ID
+	}
+	payload, err := json.Marshal(events.StatusChangedPayload{
+		ProjectID:  projectID,
+		CaseID:     caseID,
+		CaseNumber: before.Number,
+		WSO2CaseID: before.InternalID,
+		CaseTitle:  before.Subject,
+		NewStatus:  newStatus,
+		Recipients: []string{},
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "update case: encode sr.status_changed payload failed", "caseId", caseID, "error", err)
+		return
+	}
+	if err := publisher.Publish(ctx, events.TypeSRStatusChanged, caseID, payload); err != nil {
+		slog.ErrorContext(ctx, "update case: publish sr.status_changed failed", "caseId", caseID)
+		return
+	}
+	slog.InfoContext(ctx, "update case: sr.status_changed published", "caseId", caseID, "newStatus", newStatus)
+}
+
 // domain.CaseState value — never a bare enum/domain string, so
 // csm-notification-service's rendered "Status changed to <newStatus>"
 // reads the same regardless of which data source produced it. before is
