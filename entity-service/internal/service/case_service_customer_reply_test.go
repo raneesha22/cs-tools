@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -185,9 +186,14 @@ func TestCaseService_CreateCaseComment_CustomerReplyMovesToWaitingOnWSO2(t *test
 					t.Errorf("NewStatus = %q, want %q", payload.NewStatus, "Waiting on WSO2")
 				}
 				// comment_added still goes out first, then status_changed --
-				// the order snCaseService.CreateCaseComment produces.
-				if types := publishedTypes(publisher.calls); len(types) != 2 || types[0] != events.TypeCommentAdded || types[1] != events.TypeStatusChanged {
-					t.Errorf("published %v, want [case.comment_added case.status_changed]", types)
+				// the order snCaseService.CreateCaseComment produces. A
+				// service request also gets sr.status_changed, last.
+				wantTypes := []events.Type{events.TypeCommentAdded, events.TypeStatusChanged}
+				if caseType == "service_request" {
+					wantTypes = append(wantTypes, events.TypeSRStatusChanged)
+				}
+				if types := publishedTypes(publisher.calls); !slices.Equal(types, wantTypes) {
+					t.Errorf("published %v, want %v", types, wantTypes)
 				}
 			})
 		}
