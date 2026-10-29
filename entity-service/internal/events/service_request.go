@@ -41,6 +41,12 @@ const (
 	TypeSRAcknowledged Type = "sr.acknowledged"
 	// TypeSRCommentAdded: a comment or work note was added to an SR.
 	TypeSRCommentAdded Type = "sr.comment_added"
+	// TypeSRStatusChanged: an SR's state changed. Published for every SR
+	// state change, unlike case.status_changed, which is skipped when the
+	// case has no watchers to email. Payload: StatusChangedPayload with no
+	// recipients. Lets a consumer act on a close (e.g. delete an SR's log
+	// bundles) without depending on who is watching.
+	TypeSRStatusChanged Type = "sr.status_changed"
 )
 
 // SRRef is what every SR event carries about the SR itself.
