@@ -69,6 +69,19 @@ type SRCreatedPayload struct {
 	ProjectName string `json:"projectName,omitempty"`
 	CreatedBy   string `json:"createdBy,omitempty"`
 	CreatedOn   string `json:"createdOn"`
+	// CatalogItemID and Variables are the catalog item a service request was
+	// raised from and its answers, so a consumer (e.g. the log-request
+	// automation) can act on the form without reading the description.
+	// Omitted for a service request not raised from the catalog form.
+	CatalogItemID string       `json:"catalogItemId,omitempty"`
+	Variables     []SRVariable `json:"variables,omitempty"`
+}
+
+// SRVariable is one catalog form answer on sr.created: the question text as
+// the form shows it, and the answer.
+type SRVariable struct {
+	Question string `json:"question"`
+	Value    string `json:"value"`
 }
 
 // SRAcknowledgedPayload is TypeSRAcknowledged's payload.
