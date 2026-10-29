@@ -2222,6 +2222,9 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 		if label, ok := caseStateDisplayLabel[*req.State]; ok {
 			before.WatchList = s.filterActiveWatchListUsers(ctx, *before, before.WatchList)
 			publishStatusChangedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, req.ID, label, *before)
+			if before.Type != nil && *before.Type == "service_request" {
+				publishSRStatusChangedEvent(ctx, s.publisher, req.ID, label, *before)
+			}
 		}
 	}
 	if req.Severity != nil && c.Severity != nil && derefSeverity(oldSeverity) != *c.Severity {
