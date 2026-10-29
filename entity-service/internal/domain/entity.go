@@ -3855,6 +3855,13 @@ type CaseAttachment struct {
 // CreateCaseRequest is the input for creating a new case.
 // id, number, and internal_id are auto-generated; state defaults to open.
 // CreatedBy is not accepted from the request body and will be wired from auth context later.
+// ServiceRequestAnswer is one catalog form answer with its question text, as
+// stored in service_request.json_data and published on sr.created.
+type ServiceRequestAnswer struct {
+	Question string `json:"question"`
+	Value    string `json:"value"`
+}
+
 // For type "service_request": catalogId, catalogItemId, and variables are required.
 // For type "security_report_analysis": subject and description are required; attachments are optional
 // (uploaded via a separate request after creation, not bundled into this one).
@@ -3872,6 +3879,11 @@ type CreateCaseRequest struct {
 	CatalogID     string     `json:"catalogId"`
 	CatalogItemID string     `json:"catalogItemId"`
 	Variables     []Variable `json:"variables"`
+	// ServiceRequestAnswers is Variables resolved to their question text by
+	// fillServiceRequestText, in the catalog item's question order. Never
+	// read from the request body; stored on the service request so
+	// sr.created can carry it.
+	ServiceRequestAnswers []ServiceRequestAnswer `json:"-"`
 	// Optional fields
 	RelatedCaseID string `json:"relatedCaseId"`
 	// ResolvedRelatedCaseID is the related-case id already checked against
