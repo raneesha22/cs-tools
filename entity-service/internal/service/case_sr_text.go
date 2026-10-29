@@ -94,15 +94,16 @@ func isDescriptionQuestionLabel(label string) bool {
 //
 // A subject or description the caller did send is never replaced. Best
 // effort: a catalog lookup failure is logged and the SR is created as sent.
+//
+// It also sets req.ServiceRequestAnswers: every answered question with its
+// question text, in question order, whatever the caller sent as subject and
+// description. The service request stores them so sr.created can carry them.
 func fillServiceRequestText(ctx context.Context, srCatalog srCatalogReader, req *domain.CreateCaseRequest) {
 	if srCatalog == nil || req.Type != "service_request" {
 		return
 	}
 	needSubject := strings.TrimSpace(req.Subject) == ""
 	needDescription := strings.TrimSpace(req.Description) == ""
-	if !needSubject && !needDescription {
-		return
-	}
 
 	answers := make(map[string]string, len(req.Variables))
 	for _, v := range req.Variables {
@@ -152,15 +153,18 @@ func fillServiceRequestText(ctx context.Context, srCatalog srCatalogReader, req 
 	}
 
 	var paragraphs []string
+	req.ServiceRequestAnswers = nil
 	for _, q := range questions {
 		answer, ok := answers[q.ID]
 		if !ok {
 			continue
 		}
+		label := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(q.QuestionText), "*"))
+		req.ServiceRequestAnswers = append(req.ServiceRequestAnswers,
+			domain.ServiceRequestAnswer{Question: label, Value: answer})
 		if q.ID == titleQuestionID {
 			continue
 		}
-		label := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(q.QuestionText), "*"))
 		if label == "" {
 			label = "Answer"
 		}
