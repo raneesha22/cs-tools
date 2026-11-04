@@ -97,6 +97,10 @@ import CaseActionBar, {
 } from "@features/csm-cases/components/CaseActionBar";
 import AssignEngineerDialog from "@features/csm-cases/components/AssignEngineerDialog";
 import ResolutionDialog from "@features/csm-cases/components/ResolutionDialog";
+import {
+  isLogRequestCatalogItem,
+  logRequestPurgeGraceHours,
+} from "@config/logRequestConfig";
 import ChangeSeverityDialog from "@features/csm-cases/components/ChangeSeverityDialog";
 import ChangeCaseTypeDialog, {
   type CaseTypeTransferSubmission,
@@ -3245,6 +3249,14 @@ export default function CsmCaseDetailPage(): JSX.Element {
                   cause: data.resolution.cause,
                   closeNotes: data.resolution.notes,
                 }
+              : undefined
+          }
+          // A log request's logs are deleted from storage once it closes, so
+          // closing one warns about that and needs the engineer to confirm
+          // the logs were retrieved (see logRequestConfig.ts).
+          logRetrievalWarning={
+            isServiceRequest && isLogRequestCatalogItem(data?.catalogItem?.id)
+              ? { purgeGraceHours: logRequestPurgeGraceHours() }
               : undefined
           }
           onClose={() => setResolutionDialog(null)}

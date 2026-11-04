@@ -15,12 +15,16 @@
 // under the License.
 
 import {
+  Alert,
+  AlertTitle,
   Button,
+  Checkbox,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
   FormControl,
+  FormControlLabel,
   InputLabel,
   MenuItem,
   Select,
@@ -50,6 +54,15 @@ interface ResolutionDialogProps {
     cause?: BeCaseCause;
     closeNotes?: string;
   };
+  /**
+   * Set when closing a log request (a service request raised from one of
+   * `CSM_PORTAL_LOG_REQUEST_CATALOG_ITEM_IDS`): its logs are deleted from
+   * storage once it closes, so the close dialog warns about that and holds
+   * the Close button back until the engineer confirms the logs were
+   * retrieved. `purgeGraceHours` is how long after closing the deletion
+   * happens; 0 means at once. Ignored for `propose_solution`.
+   */
+  logRetrievalWarning?: { purgeGraceHours: number };
   onClose: () => void;
   onSubmit: (fields: {
     resolutionCode: BeCaseResolutionCode;
@@ -74,6 +87,32 @@ const COPY: Record<
   },
 };
 
+/** "48 hours", "1 hour". */
+function formatHours(hours: number): string {
+  return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+}
+
+/** The warning and confirmation copy for closing a log request. */
+function logRetrievalCopy(purgeGraceHours: number): {
+  title: string;
+  body: string;
+  confirm: string;
+} {
+  if (purgeGraceHours > 0) {
+    const when = formatHours(purgeGraceHours);
+    return {
+      title: `The logs are deleted ${when} after this request closes`,
+      body: `This is a log request. ${when} after it is closed, its log bundle is deleted from storage and can't be downloaded again. Make sure everyone in “People with access” has downloaded the logs.`,
+      confirm: `I've confirmed the logs have been downloaded, or will be within ${when}.`,
+    };
+  }
+  return {
+    title: "The logs are deleted when this request closes",
+    body: "This is a log request. As soon as it is closed, its log bundle is deleted from storage and can't be downloaded again. Make sure everyone in “People with access” has downloaded the logs.",
+    confirm: "I've confirmed the logs have been downloaded.",
+  };
+}
+
 /**
  * Collects the Post Resolution Activity (ISSU-026) — resolution code, root
  * cause, and free-text close notes — before closing a case or proposing a
@@ -87,6 +126,7 @@ export default function ResolutionDialog({
   kind,
   isSubmitting,
   initial,
+  logRetrievalWarning,
   onClose,
   onSubmit,
 }: ResolutionDialogProps): JSX.Element {
@@ -96,10 +136,22 @@ export default function ResolutionDialog({
   const [cause, setCause] = useState<BeCaseCause | "">(initial?.cause ?? "");
   const [closeNotes, setCloseNotes] = useState(initial?.closeNotes ?? "");
   const [closeNotesTouched, setCloseNotesTouched] = useState(false);
+  // Always starts unticked, even with prefilled fields: the confirmation is
+  // about this close, not a previous one.
+  const [logsRetrieved, setLogsRetrieved] = useState(false);
   const copy = COPY[kind];
+  const logCopy =
+    kind === "close" && logRetrievalWarning
+      ? logRetrievalCopy(logRetrievalWarning.purgeGraceHours)
+      : null;
   const hasCloseNotes = closeNotes.trim().length > 0;
   const closeNotesInvalid = closeNotesTouched && !hasCloseNotes;
-  const canSubmit = !!resolutionCode && !!cause && hasCloseNotes && !isSubmitting;
+  const canSubmit =
+    !!resolutionCode &&
+    !!cause &&
+    hasCloseNotes &&
+    (!logCopy || logsRetrieved) &&
+    !isSubmitting;
 
   return (
     <Dialog open onClose={onClose} maxWidth="xs" fullWidth>
@@ -111,6 +163,13 @@ export default function ResolutionDialog({
         <Typography variant="body2" color="text.secondary">
           {copy.body}
         </Typography>
+
+        {logCopy && (
+          <Alert severity="warning">
+            <AlertTitle>{logCopy.title}</AlertTitle>
+            {logCopy.body}
+          </Alert>
+        )}
 
         <FormControl fullWidth size="small" required>
           <InputLabel
@@ -178,6 +237,19 @@ export default function ResolutionDialog({
           }
           placeholder="Describe the resolution…"
         />
+
+        {logCopy && (
+          <FormControlLabel
+            required
+            control={
+              <Checkbox
+                checked={logsRetrieved}
+                onChange={(e) => setLogsRetrieved(e.target.checked)}
+              />
+            }
+            label={logCopy.confirm}
+          />
+        )}
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose} disabled={isSubmitting}>
@@ -188,7 +260,7 @@ export default function ResolutionDialog({
           color={kind === "close" ? "warning" : "primary"}
           disabled={!canSubmit}
           onClick={() => {
-            if (!resolutionCode || !cause || !hasCloseNotes) {
+            if (!resolutionCode || !cause || !hasCloseNotes || (logCopy && !logsRetrieved)) {
               setCloseNotesTouched(true);
               return;
             }

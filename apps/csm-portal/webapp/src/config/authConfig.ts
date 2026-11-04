@@ -118,6 +118,21 @@ declare global {
        * `onboardingStatusConfig.ts`.
        */
       CSM_MIGRATION_ONBOARDING_STATUS_ENABLED?: boolean | string;
+      /**
+       * Catalog item ids whose service requests are log requests (an array,
+       * or one comma-separated string). Closing one asks the engineer to
+       * confirm the logs were retrieved, because the log collection
+       * automation deletes them on close. Unset means no change to the close
+       * dialog — see `logRequestConfig.ts`.
+       */
+      CSM_PORTAL_LOG_REQUEST_CATALOG_ITEM_IDS?: string[] | string;
+      /**
+       * Hours after a log request closes before its logs are deleted, quoted
+       * in that confirmation. Must match the log collection automation's own
+       * setting. Unset or 0 means "deleted when the request closes" — see
+       * `logRequestConfig.ts`.
+       */
+      CSM_PORTAL_LOG_REQUEST_PURGE_GRACE_HOURS?: number | string;
     };
   }
 }

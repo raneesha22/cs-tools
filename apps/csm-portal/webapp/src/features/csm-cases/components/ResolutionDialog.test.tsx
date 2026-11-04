@@ -121,6 +121,122 @@ describe("ResolutionDialog", () => {
     });
   });
 
+  describe("closing a log request", () => {
+    function fillRequiredFields(): void {
+      chooseOption("resolution-code-label", /solved.*fixed by support\/guidance provided/i);
+      chooseOption("case-cause-label", /product\/bug/i);
+      fireEvent.change(screen.getByLabelText(/close notes/i), {
+        target: { value: "Logs delivered to the requester." },
+      });
+    }
+
+    it("warns that the logs are deleted, quoting the grace period", () => {
+      render(
+        <ResolutionDialog
+          kind="close"
+          isSubmitting={false}
+          logRetrievalWarning={{ purgeGraceHours: 48 }}
+          onClose={() => {}}
+          onSubmit={() => {}}
+        />,
+      );
+      expect(
+        screen.getByText(/the logs are deleted 48 hours after this request closes/i),
+      ).toBeInTheDocument();
+      expect(screen.getByText(/everyone in “people with access”/i)).toBeInTheDocument();
+      expect(
+        screen.getByRole("checkbox", { name: /downloaded, or will be within 48 hours/i }),
+      ).not.toBeChecked();
+    });
+
+    it("says the logs are deleted at once when there is no grace period", () => {
+      render(
+        <ResolutionDialog
+          kind="close"
+          isSubmitting={false}
+          logRetrievalWarning={{ purgeGraceHours: 0 }}
+          onClose={() => {}}
+          onSubmit={() => {}}
+        />,
+      );
+      expect(
+        screen.getByText(/the logs are deleted when this request closes/i),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("checkbox", { name: /^i've confirmed the logs have been downloaded\.$/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("keeps Close case disabled until the retrieval is confirmed", () => {
+      const onSubmit = vi.fn();
+      render(
+        <ResolutionDialog
+          kind="close"
+          isSubmitting={false}
+          logRetrievalWarning={{ purgeGraceHours: 48 }}
+          onClose={() => {}}
+          onSubmit={onSubmit}
+        />,
+      );
+      fillRequiredFields();
+      expect(screen.getByRole("button", { name: /close case/i })).toBeDisabled();
+
+      fireEvent.click(screen.getByRole("checkbox", { name: /logs have been downloaded/i }));
+      expect(screen.getByRole("button", { name: /close case/i })).not.toBeDisabled();
+
+      fireEvent.click(screen.getByRole("button", { name: /close case/i }));
+      expect(onSubmit).toHaveBeenCalledWith({
+        resolutionCode: "SOLVED_FIXED_BY_SUPPORT_GUIDANCE_PROVIDED",
+        cause: expect.any(String),
+        closeNotes: "Logs delivered to the requester.",
+      });
+    });
+
+    it("starts unconfirmed even when the other fields are prefilled", () => {
+      render(
+        <ResolutionDialog
+          kind="close"
+          isSubmitting={false}
+          initial={{
+            resolutionCode: "SOLVED_BY_CUSTOMER",
+            cause: "UNKNOWN",
+            closeNotes: "Closed before.",
+          }}
+          logRetrievalWarning={{ purgeGraceHours: 48 }}
+          onClose={() => {}}
+          onSubmit={() => {}}
+        />,
+      );
+      expect(screen.getByRole("button", { name: /close case/i })).toBeDisabled();
+    });
+
+    it("shows nothing extra without the warning, or when proposing a solution", () => {
+      const { unmount } = render(
+        <ResolutionDialog
+          kind="close"
+          isSubmitting={false}
+          onClose={() => {}}
+          onSubmit={() => {}}
+        />,
+      );
+      expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+      expect(screen.queryByText(/the logs are deleted/i)).not.toBeInTheDocument();
+      unmount();
+
+      render(
+        <ResolutionDialog
+          kind="propose_solution"
+          isSubmitting={false}
+          logRetrievalWarning={{ purgeGraceHours: 48 }}
+          onClose={() => {}}
+          onSubmit={() => {}}
+        />,
+      );
+      expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+      expect(screen.queryByText(/the logs are deleted/i)).not.toBeInTheDocument();
+    });
+  });
+
   it("calls onClose when cancelled", () => {
     const onClose = vi.fn();
     render(
