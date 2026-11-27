@@ -457,6 +457,9 @@ vi.mock("@features/csm-cases/components/CaseActionBar", () => ({
       >
         stub propose solution
       </button>
+      <button type="button" onClick={() => onAction("close", "closed")}>
+        stub close
+      </button>
     </>
   ),
   canAcknowledge: () => false,
@@ -464,8 +467,22 @@ vi.mock("@features/csm-cases/components/CaseActionBar", () => ({
 vi.mock("@features/csm-cases/components/AssignEngineerDialog", () => ({
   default: () => null,
 }));
+// Probe: the dialog's own fields and the log-retrieval checkbox are covered
+// in ResolutionDialog.test.tsx. Here it only reports what the page passed.
 vi.mock("@features/csm-cases/components/ResolutionDialog", () => ({
-  default: () => null,
+  default: ({
+    kind,
+    logRetrievalWarning,
+  }: {
+    kind: string;
+    logRetrievalWarning?: { purgeGraceHours: number };
+  }) => (
+    <div
+      data-testid="resolution-dialog"
+      data-kind={kind}
+      data-log-retrieval-warning={JSON.stringify(logRetrievalWarning ?? null)}
+    />
+  ),
 }));
 vi.mock("@features/csm-cases/components/ChangeSeverityDialog", () => ({
   default: () => null,
@@ -2210,6 +2227,97 @@ describe("CsmCaseDetailPage — change case type: a refused transfer", () => {
 
     expect(showErrorMock).toHaveBeenCalledTimes(1);
     expect(showErrorMock).toHaveBeenCalledWith("Could not change the case type.", expect.anything());
+  });
+});
+
+describe("CsmCaseDetailPage — closing a log request asks to confirm the logs were downloaded", () => {
+  let originalConfig: typeof window.config;
+
+  function mockCase(overrides: Partial<CsmCaseDetail>): void {
+    useGetCsmCaseDetailMock.mockImplementation((id: string | undefined) => ({
+      data: id ? { ...buildCase(id), ...overrides } : undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: vi.fn(),
+      isFetching: false,
+      dataUpdatedAt: 0,
+    }));
+  }
+
+  function openCloseDialog(): HTMLElement {
+    renderPageAt(
+      "/operations/service-requests/case-1",
+      "/operations/service-requests/:caseId",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /stub close/i }));
+    return screen.getByTestId("resolution-dialog");
+  }
+
+  beforeEach(() => {
+    originalConfig = window.config;
+    window.config = {
+      ...(originalConfig ?? {}),
+      CSM_PORTAL_LOG_REQUEST_PURGE_GRACE_HOURS: 72,
+    } as typeof window.config;
+  });
+
+  afterEach(() => {
+    window.config = originalConfig;
+    useGetCsmCaseDetailMock.mockImplementation((id: string | undefined) => ({
+      data: id ? buildCase(id) : undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      refetch: vi.fn(),
+      isFetching: false,
+      dataUpdatedAt: 0,
+    }));
+  });
+
+  const logRequestTags = [
+    { id: "t1", label: "urgent" },
+    { id: "t2", label: "component-log-request" },
+  ];
+
+  it("passes the warning with the configured grace period for a tagged service request", () => {
+    mockCase({ caseType: "service_request", tags: logRequestTags });
+
+    const dialog = openCloseDialog();
+
+    expect(dialog).toHaveAttribute("data-kind", "close");
+    expect(dialog).toHaveAttribute(
+      "data-log-retrieval-warning",
+      JSON.stringify({ purgeGraceHours: 72 }),
+    );
+  });
+
+  it("quotes 48 hours when the grace period is not configured", () => {
+    window.config.CSM_PORTAL_LOG_REQUEST_PURGE_GRACE_HOURS = undefined;
+    mockCase({ caseType: "service_request", tags: logRequestTags });
+
+    expect(openCloseDialog()).toHaveAttribute(
+      "data-log-retrieval-warning",
+      JSON.stringify({ purgeGraceHours: 48 }),
+    );
+  });
+
+  it("passes no warning for a service request without the tag", () => {
+    mockCase({ caseType: "service_request", tags: [{ id: "t1", label: "urgent" }] });
+
+    expect(openCloseDialog()).toHaveAttribute("data-log-retrieval-warning", "null");
+  });
+
+  it("passes no warning for a plain case, even one carrying the tag", () => {
+    mockCase({ tags: logRequestTags });
+
+    renderPageAt("/cases/case-1");
+    fireEvent.click(screen.getByRole("button", { name: /stub close/i }));
+
+    expect(screen.getByTestId("resolution-dialog")).toHaveAttribute(
+      "data-log-retrieval-warning",
+      "null",
+    );
   });
 });
 

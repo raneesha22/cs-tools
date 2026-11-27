@@ -261,6 +261,16 @@ window.config = {
   // turns it off; true (or leaving it unset) keeps it on.
   // CSM_PORTAL_DOWNLOAD_TO_DISK: true,
 
+  // Log requests: a Component Log Request's logs are collected into storage
+  // by the log collection automation, which deletes them a grace period after
+  // the request closes. Closing one (the CSM backend tags it
+  // "component-log-request") shows a warning and a required "the logs have
+  // been downloaded" checkbox. Hours after closing before the logs are
+  // deleted, quoted in the warning; must match the automation's
+  // PURGE_GRACE_HOURS. Unset: 48 (the automation's default). 0: the warning
+  // says the logs are deleted when the request closes.
+  // CSM_PORTAL_LOG_REQUEST_PURGE_GRACE_HOURS: 48,
+
   // Project key an announcement's "Send test" dry run creates its one real
   // test case in (mirrors the ServiceNow flow's own hardcoded
   // Project Key = DCPSUB dry-run scoping). Defaults to "DCPSUB" itself when

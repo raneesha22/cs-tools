@@ -161,6 +161,14 @@ declare global {
        * `attachmentLimitsConfig.ts`.
        */
       CSM_PORTAL_DOWNLOAD_TO_DISK?: boolean | string;
+      /**
+       * Hours after a log request closes before its logs are deleted, quoted
+       * in the close dialog's warning. Must match the log collection
+       * automation's PURGE_GRACE_HOURS. Unset means 48, the automation's
+       * default; 0 means "deleted when the request closes" — see
+       * `logRequestConfig.ts`.
+       */
+      CSM_PORTAL_LOG_REQUEST_PURGE_GRACE_HOURS?: number | string;
     };
   }
 }
