@@ -143,7 +143,7 @@ describe("ResolutionDialog", () => {
       expect(
         screen.getByText(/the logs are deleted 48 hours after this request closes/i),
       ).toBeInTheDocument();
-      expect(screen.getByText(/everyone in “people with access”/i)).toBeInTheDocument();
+      expect(screen.getByText(/everyone in “people who need access”/i)).toBeInTheDocument();
       expect(
         screen.getByRole("checkbox", { name: /downloaded, or will be within 48 hours/i }),
       ).not.toBeChecked();
