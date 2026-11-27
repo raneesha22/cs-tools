@@ -32,7 +32,15 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 )
 
-const logCollectionEventType = "request_logs"
+const (
+	logCollectionEventType = "request_logs"
+	logPurgeEventType      = "purge_case"
+	// logRequestTag marks a service request the pipeline was started for. A
+	// Postgres service request does not keep its catalog item, so closing one
+	// finds out it is a log request from this tag. The portal's close dialog
+	// keys its warning on the same label.
+	logRequestTag = "component-log-request"
+)
 
 // Question ids of the "Component Log Request" catalog item. Entity-service
 // migration 0298 fixes them, so they are the same in every environment.
@@ -86,15 +94,16 @@ type logCollection struct {
 }
 
 // WithLogCollection makes POST /cases start the log collection pipeline after
-// a service request is created from cfg.CatalogItemID. Unset, POST /cases is
-// unchanged.
+// a service request is created from cfg.CatalogItemID, and closing such a
+// request (PATCH /cases/{id}) ask the pipeline to delete its logs. Unset,
+// both are unchanged.
 func (h *CaseHandler) WithLogCollection(pipeline pipelineDispatcher, cfg LogCollectionConfig) *CaseHandler {
 	h.logCollection = &logCollection{pipeline: pipeline, cfg: cfg}
 	return h
 }
 
-// WaitForLogCollection lets starts still retrying finish before shutdown, up
-// to ctx's deadline.
+// WaitForLogCollection lets dispatches still retrying finish before shutdown,
+// up to ctx's deadline.
 func (h *CaseHandler) WaitForLogCollection(ctx context.Context) {
 	if h.logCollection == nil {
 		return
@@ -192,8 +201,73 @@ func (h *CaseHandler) dispatchLogCollection(ctx context.Context, user *middlewar
 		return
 	}
 	slog.InfoContext(ctx, "log collection started", "userID", user.UserID, "caseID", caseID, "requestID", caseNumber, "repo", repo)
+	h.tagLogRequest(ctx, user, caseID)
 	h.addLogCollectionWorkNote(ctx, user, caseID,
 		"Log collection started. The result will be posted here when it finishes.")
+}
+
+// tagLogRequest is best-effort. Without the tag, closing the request does not
+// delete its logs; the pipeline's retention period still does.
+func (h *CaseHandler) tagLogRequest(ctx context.Context, user *middleware.UserInfo, caseID string) {
+	tag, err := json.Marshal(map[string]string{"label": logRequestTag})
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to build log request tag", "userID", user.UserID, "caseID", caseID, "err", err)
+		return
+	}
+	if _, err := h.entity.AddCaseTag(ctx, caseID, tag); err != nil {
+		slog.WarnContext(ctx, "failed to tag log request; closing it will not delete its logs", "userID", user.UserID, "caseID", caseID, "err", err)
+	}
+}
+
+type caseTags struct {
+	Tags []struct {
+		Label string `json:"label"`
+	} `json:"tags"`
+}
+
+func (c caseTags) has(label string) bool {
+	for _, t := range c.Tags {
+		if t.Label == label {
+			return true
+		}
+	}
+	return false
+}
+
+// startLogPurge asks the pipeline, in the background, to delete a closed log
+// request's logs. The pipeline keeps them for its grace period first, so the
+// people on the request can still download them.
+func (h *CaseHandler) startLogPurge(ctx context.Context, user *middleware.UserInfo, caseID string) {
+	lc := h.logCollection
+	if lc == nil {
+		return
+	}
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logCollectionStartTimeout)
+	lc.running.Add(1)
+	go func() {
+		defer lc.running.Done()
+		defer cancel()
+		h.dispatchLogPurge(bgCtx, user, caseID)
+	}()
+}
+
+func (h *CaseHandler) dispatchLogPurge(ctx context.Context, user *middleware.UserInfo, caseID string) {
+	lc := h.logCollection
+	repo := lc.cfg.Owner + "/" + lc.cfg.Repo
+	err := dispatchWithRetry(ctx,
+		func(ctx context.Context) error {
+			return lc.pipeline.DispatchRepositoryEvent(ctx, lc.cfg.Owner, lc.cfg.Owner, lc.cfg.Repo, logPurgeEventType, map[string]any{"case_id": caseID})
+		},
+		func(attempt int, err error) {
+			slog.WarnContext(ctx, "log deletion dispatch attempt failed", "userID", user.UserID, "caseID", caseID, "attempt", attempt, "err", err)
+		})
+	if err != nil {
+		slog.ErrorContext(ctx, "log deletion could not be requested", "userID", user.UserID, "caseID", caseID, "repo", repo, "err", err)
+		h.addLogCollectionWorkNote(ctx, user, caseID,
+			"The logs of this request could not be scheduled for deletion ("+dispatchFailureReason(err)+"). Ask the SRE team to delete them; otherwise they are deleted when the retention period ends.")
+		return
+	}
+	slog.InfoContext(ctx, "log deletion requested", "userID", user.UserID, "caseID", caseID, "repo", repo)
 }
 
 // buildPipelinePayload leaves empty answers out. GitHub allows 10 top-level

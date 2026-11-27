@@ -1329,6 +1329,7 @@ func (h *CaseHandler) PatchCase(w http.ResponseWriter, r *http.Request) {
 	// (closing branch, below) reuses it so closing a case doesn't need a
 	// second GetCase round trip just to know what state it's leaving.
 	var previousCaseState string
+	var closingLogRequest bool
 	if patchErr == nil && (patch.State != nil || patch.WorkState != nil) {
 		current, err := h.entity.GetCase(r.Context(), caseID)
 		if err != nil {
@@ -1338,6 +1339,7 @@ func (h *CaseHandler) PatchCase(w http.ResponseWriter, r *http.Request) {
 		}
 		var currentCase struct {
 			State string `json:"state"`
+			caseTags
 		}
 		if err := json.Unmarshal(current, &currentCase); err != nil {
 			slog.ErrorContext(r.Context(), "failed to parse current case state", "userID", user.UserID, "caseID", caseID, "err", err)
@@ -1345,6 +1347,7 @@ func (h *CaseHandler) PatchCase(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		previousCaseState = currentCase.State
+		closingLogRequest = patch.State != nil && *patch.State == caseStateClosed && currentCase.has(logRequestTag)
 		if patch.State != nil && !isValidStateTransition(currentCase.State, *patch.State) {
 			writeError(w, http.StatusBadRequest, ErrMsgInvalidTransition)
 			return
@@ -1442,6 +1445,10 @@ func (h *CaseHandler) PatchCase(w http.ResponseWriter, r *http.Request) {
 			defer cancel()
 			h.recordPendingVerificationEntry(ctx, user, caseID, previousCaseState)
 		}()
+	}
+
+	if closingLogRequest {
+		h.startLogPurge(r.Context(), user, caseID)
 	}
 
 	writeJSON(w, http.StatusOK, result)

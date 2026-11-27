@@ -510,8 +510,15 @@ Notes:
   service. The answers are matched by question id and sent as the payload, with the case id, the
   case number as `request_id`, and the signed-in user's email as `requested_by`. A network error,
   timeout, `429` or `5xx` is retried, up to 3 attempts about 2s and 8s apart; a `4xx` is not. A work
-  note on the case says whether the collection started. Shutdown waits for a start still retrying,
-  within the shutdown window.
+  note on the case says whether the collection started. Once started, the case is tagged
+  `component-log-request`: a Postgres service request does not keep its catalog item, so the tag is
+  what marks it as a log request later.
+- Closing a case tagged `component-log-request` (`PATCH /cases/{id}` to `closed`) sends a
+  `purge_case` repository dispatch (`{"case_id": …}`) to the same repository, in the background and
+  with the same retry. The pipeline deletes the logs after its grace period (48 hours). A work note
+  is added only if the dispatch fails. Reopening does not cancel it, and a case closed some other
+  way (e.g. auto-closure) is not covered: its logs go when the pipeline's retention period ends.
+  Shutdown waits for a dispatch still retrying, within the shutdown window.
 
 ### Feature flags
 

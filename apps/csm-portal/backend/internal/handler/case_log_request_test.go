@@ -111,9 +111,11 @@ func completeLogRequestAnswers() map[string]string {
 }
 
 type logCollectionTest struct {
-	h     *CaseHandler
-	disp  *mockPipelineDispatcher
-	notes []string
+	h      *CaseHandler
+	disp   *mockPipelineDispatcher
+	client *mockEntityCaseClient
+	notes  []string
+	tags   []string
 }
 
 func newLogCollectionTest(t *testing.T, disp *mockPipelineDispatcher, createErr error) *logCollectionTest {
@@ -137,7 +139,18 @@ func newLogCollectionTest(t *testing.T, disp *mockPipelineDispatcher, createErr 
 			mu.Unlock()
 			return []byte(`{}`), nil
 		},
+		addCaseTagFn: func(_ context.Context, caseID string, body []byte) ([]byte, error) {
+			var tag struct{ Label string }
+			if err := json.Unmarshal(body, &tag); err != nil || caseID != testLogCaseID {
+				t.Errorf("tag = %s on case %s, want a label on %s", body, caseID, testLogCaseID)
+			}
+			mu.Lock()
+			lt.tags = append(lt.tags, tag.Label)
+			mu.Unlock()
+			return []byte(`{"id":"44444444-4444-4444-4444-444444444444","label":"` + tag.Label + `"}`), nil
+		},
 	}
+	lt.client = client
 	lt.h = NewCaseHandler(client).WithLogCollection(disp, LogCollectionConfig{
 		CatalogItemID: testLogItemID, Owner: testLogOwner, Repo: testLogRepo, Team: testLogTeam,
 	})
@@ -193,6 +206,21 @@ func TestCreateCase_LogCollection(t *testing.T) {
 		if len(c.payload) > 10 {
 			t.Errorf("payload has %d top-level properties; GitHub allows 10", len(c.payload))
 		}
+		if len(lt.notes) != 1 || !strings.HasPrefix(lt.notes[0], "Log collection started.") {
+			t.Errorf("work notes = %q", lt.notes)
+		}
+		if !reflect.DeepEqual(lt.tags, []string{"component-log-request"}) {
+			t.Errorf("tags = %q, want the log request tag", lt.tags)
+		}
+	})
+
+	t.Run("still notes the start when the tag cannot be added", func(t *testing.T) {
+		lt := newLogCollectionTest(t, &mockPipelineDispatcher{}, nil)
+		lt.client.addCaseTagFn = func(context.Context, string, []byte) ([]byte, error) {
+			return nil, &apierror.Error{StatusCode: http.StatusInternalServerError}
+		}
+		lt.create(t, logRequestBody(testLogItemID, completeLogRequestAnswers()))
+
 		if len(lt.notes) != 1 || !strings.HasPrefix(lt.notes[0], "Log collection started.") {
 			t.Errorf("work notes = %q", lt.notes)
 		}
@@ -268,8 +296,8 @@ func TestCreateCase_LogCollection(t *testing.T) {
 		answers[podNameQuestionID] = "  "
 		lt.create(t, logRequestBody(testLogItemID, answers))
 
-		if len(lt.disp.calls) != 0 {
-			t.Errorf("dispatch calls = %d, want 0", len(lt.disp.calls))
+		if len(lt.disp.calls) != 0 || len(lt.tags) != 0 {
+			t.Errorf("dispatch calls = %d, tags = %q; want none", len(lt.disp.calls), lt.tags)
 		}
 		if len(lt.notes) != 1 || !strings.Contains(lt.notes[0], "Cluster, Pod Name") {
 			t.Errorf("work notes = %q, want one naming Cluster and Pod Name", lt.notes)
@@ -288,6 +316,156 @@ func TestCreateCase_LogCollection(t *testing.T) {
 		if strings.Contains(lt.notes[0], "token detail") {
 			t.Error("the work note carries the upstream response body")
 		}
+		if len(lt.tags) != 0 {
+			t.Errorf("tags = %q; a request that never started has no logs to delete", lt.tags)
+		}
+	})
+}
+
+const (
+	taggedLogCase   = `{"id":"` + testLogCaseID + `","state":"work_in_progress","tags":[{"id":"t1","label":"urgent"},{"id":"t2","label":"component-log-request"}]}`
+	untaggedLogCase = `{"id":"` + testLogCaseID + `","state":"work_in_progress","tags":[{"id":"t1","label":"urgent"}]}`
+)
+
+// patch calls PatchCase on the test case and waits for background dispatches.
+func (lt *logCollectionTest) patch(t *testing.T, currentCase, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	lt.client.getCaseFn = func(context.Context, string) ([]byte, error) { return []byte(currentCase), nil }
+	if lt.client.patchCaseFn == nil {
+		lt.client.patchCaseFn = func(context.Context, string, []byte) ([]byte, error) {
+			return []byte(`{"id":"` + testLogCaseID + `"}`), nil
+		}
+	}
+	r := withUser(httptest.NewRequest(http.MethodPatch, "/cases/"+testLogCaseID, strings.NewReader(body)))
+	r.SetPathValue("id", testLogCaseID)
+	w := httptest.NewRecorder()
+	lt.h.PatchCase(w, r)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lt.h.WaitForLogCollection(ctx)
+	return w
+}
+
+func TestPatchCase_LogPurge(t *testing.T) {
+	noDispatchRetryWait(t)
+	const closeBody = `{"state":"closed"}`
+
+	t.Run("closing a log request asks the pipeline to delete its logs", func(t *testing.T) {
+		lt := newLogCollectionTest(t, &mockPipelineDispatcher{}, nil)
+		w := lt.patch(t, taggedLogCase, closeBody)
+
+		assertStatus(t, w, http.StatusOK)
+		if len(lt.disp.calls) != 1 {
+			t.Fatalf("dispatch calls = %d, want 1", len(lt.disp.calls))
+		}
+		c := lt.disp.calls[0]
+		if c.orgName != testLogOwner || c.owner != testLogOwner || c.repo != testLogRepo || c.eventType != "purge_case" {
+			t.Errorf("dispatch target = %+v", c)
+		}
+		if want := map[string]any{"case_id": testLogCaseID}; !reflect.DeepEqual(c.payload, want) {
+			t.Errorf("payload = %v, want %v", c.payload, want)
+		}
+		if len(lt.notes) != 0 {
+			t.Errorf("work notes = %q, want none", lt.notes)
+		}
+	})
+
+	t.Run("leaves other cases alone", func(t *testing.T) {
+		lt := newLogCollectionTest(t, &mockPipelineDispatcher{}, nil)
+		lt.patch(t, untaggedLogCase, closeBody)
+		lt.patch(t, `{"id":"`+testLogCaseID+`","state":"work_in_progress","tags":null}`, closeBody)
+
+		if len(lt.disp.calls) != 0 {
+			t.Errorf("dispatch calls = %d, want 0", len(lt.disp.calls))
+		}
+	})
+
+	t.Run("only on close", func(t *testing.T) {
+		lt := newLogCollectionTest(t, &mockPipelineDispatcher{}, nil)
+		lt.patch(t, taggedLogCase, `{"state":"solution_proposed"}`)
+		lt.patch(t, taggedLogCase, `{"workState":"investigating"}`)
+		lt.patch(t, taggedLogCase, `{"subject":"renamed"}`)
+
+		if len(lt.disp.calls) != 0 {
+			t.Errorf("dispatch calls = %d, want 0", len(lt.disp.calls))
+		}
+	})
+
+	t.Run("not when the close fails", func(t *testing.T) {
+		lt := newLogCollectionTest(t, &mockPipelineDispatcher{}, nil)
+		lt.client.patchCaseFn = func(context.Context, string, []byte) ([]byte, error) {
+			return nil, &apierror.Error{StatusCode: http.StatusConflict, Body: `{"message":"conflict"}`}
+		}
+		w := lt.patch(t, taggedLogCase, closeBody)
+
+		assertStatus(t, w, http.StatusConflict)
+		if len(lt.disp.calls) != 0 {
+			t.Errorf("dispatch calls = %d, want 0", len(lt.disp.calls))
+		}
+	})
+
+	t.Run("retries, then notes a failure on the case without the upstream body", func(t *testing.T) {
+		unavailable := &apierror.Error{StatusCode: http.StatusServiceUnavailable, Body: "token detail"}
+		lt := newLogCollectionTest(t, &mockPipelineDispatcher{errs: []error{unavailable, unavailable, unavailable}}, nil)
+		w := lt.patch(t, taggedLogCase, closeBody)
+
+		assertStatus(t, w, http.StatusOK)
+		if len(lt.disp.calls) != 3 {
+			t.Errorf("dispatch calls = %d, want 3", len(lt.disp.calls))
+		}
+		if len(lt.notes) != 1 || !strings.Contains(lt.notes[0], "could not be scheduled for deletion (the Engineering Entity Service answered 503)") {
+			t.Errorf("work notes = %q", lt.notes)
+		}
+		if strings.Contains(lt.notes[0], "token detail") {
+			t.Error("the work note carries the upstream response body")
+		}
+	})
+
+	t.Run("a retry that succeeds notes nothing", func(t *testing.T) {
+		lt := newLogCollectionTest(t, &mockPipelineDispatcher{errs: []error{&apierror.Error{StatusCode: http.StatusBadGateway}}}, nil)
+		lt.patch(t, taggedLogCase, closeBody)
+
+		if len(lt.disp.calls) != 2 || len(lt.notes) != 0 {
+			t.Errorf("calls = %d, notes = %q; want 2 and none", len(lt.disp.calls), lt.notes)
+		}
+	})
+
+	t.Run("answers before the dispatch, which keeps the request's values but not its cancellation", func(t *testing.T) {
+		disp := &mockPipelineDispatcher{release: make(chan struct{})}
+		lt := newLogCollectionTest(t, disp, nil)
+		lt.client.getCaseFn = func(context.Context, string) ([]byte, error) { return []byte(taggedLogCase), nil }
+		lt.client.patchCaseFn = func(context.Context, string, []byte) ([]byte, error) { return []byte(`{}`), nil }
+		ctx, cancelRequest := context.WithCancel(context.Background())
+		r := withUser(httptest.NewRequest(http.MethodPatch, "/cases/"+testLogCaseID, strings.NewReader(closeBody)).WithContext(ctx))
+		r.SetPathValue("id", testLogCaseID)
+		w := httptest.NewRecorder()
+
+		lt.h.PatchCase(w, r) // returns while the dispatch is still held
+		assertStatus(t, w, http.StatusOK)
+		cancelRequest()
+		close(disp.release)
+		waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		lt.h.WaitForLogCollection(waitCtx)
+
+		if len(disp.calls) != 1 || disp.calls[0].ctxErr != nil {
+			t.Fatalf("calls = %+v, want one with a live context", disp.calls)
+		}
+	})
+
+	t.Run("does nothing when not configured", func(t *testing.T) {
+		client := &mockEntityCaseClient{
+			getCaseFn:   func(context.Context, string) ([]byte, error) { return []byte(taggedLogCase), nil },
+			patchCaseFn: func(context.Context, string, []byte) ([]byte, error) { return []byte(`{}`), nil },
+		}
+		h := NewCaseHandler(client)
+		r := withUser(httptest.NewRequest(http.MethodPatch, "/cases/"+testLogCaseID, strings.NewReader(closeBody)))
+		r.SetPathValue("id", testLogCaseID)
+		w := httptest.NewRecorder()
+		h.PatchCase(w, r)
+		h.WaitForLogCollection(context.Background())
+
+		assertStatus(t, w, http.StatusOK)
 	})
 }
 
